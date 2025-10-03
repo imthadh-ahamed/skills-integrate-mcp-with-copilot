@@ -10,6 +10,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+from sqlmodel import select
+
+from .db import create_db_and_tables, get_session
+from .models import Activity, Participant
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -19,8 +23,8 @@ current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
 
-# In-memory activity database
-activities = {
+# Legacy in-memory activities (used only for first-run migration)
+_legacy_activities = {
     "Chess Club": {
         "description": "Learn strategies and compete in chess tournaments",
         "schedule": "Fridays, 3:30 PM - 5:00 PM",
@@ -85,48 +89,80 @@ def root():
 
 @app.get("/activities")
 def get_activities():
-    return activities
+    # Return activities from DB
+    with get_session() as session:
+        activities = session.exec(select(Activity)).all()
+        result = []
+        for a in activities:
+            participants = session.exec(select(Participant).where(Participant.activity_id == a.id)).all()
+            result.append({
+                "id": a.id,
+                "name": a.name,
+                "description": a.description,
+                "schedule": a.schedule,
+                "max_participants": a.max_participants,
+                "participants": [p.email for p in participants]
+            })
+        return result
 
 
 @app.post("/activities/{activity_name}/signup")
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
-    # Validate activity exists
-    if activity_name not in activities:
-        raise HTTPException(status_code=404, detail="Activity not found")
+    with get_session() as session:
+        activity = session.exec(select(Activity).where(Activity.name == activity_name)).one_or_none()
+        if not activity:
+            raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
-    activity = activities[activity_name]
+        current = session.exec(select(Participant).where(Participant.activity_id == activity.id, Participant.email == email)).one_or_none()
+        if current:
+            raise HTTPException(status_code=400, detail="Student is already signed up")
 
-    # Validate student is not already signed up
-    if email in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is already signed up"
-        )
+        # enforce capacity if set
+        if activity.max_participants is not None:
+            count = session.exec(select(Participant).where(Participant.activity_id == activity.id)).count()
+            if count >= activity.max_participants:
+                raise HTTPException(status_code=400, detail="Activity is full")
 
-    # Add student
-    activity["participants"].append(email)
-    return {"message": f"Signed up {email} for {activity_name}"}
+        participant = Participant(email=email, activity_id=activity.id)
+        session.add(participant)
+        session.commit()
+        session.refresh(participant)
+        return {"message": f"Signed up {email} for {activity_name}", "participant_id": participant.id}
 
 
 @app.delete("/activities/{activity_name}/unregister")
 def unregister_from_activity(activity_name: str, email: str):
     """Unregister a student from an activity"""
-    # Validate activity exists
-    if activity_name not in activities:
-        raise HTTPException(status_code=404, detail="Activity not found")
+    with get_session() as session:
+        activity = session.exec(select(Activity).where(Activity.name == activity_name)).one_or_none()
+        if not activity:
+            raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
-    activity = activities[activity_name]
+        participant = session.exec(select(Participant).where(Participant.activity_id == activity.id, Participant.email == email)).one_or_none()
+        if not participant:
+            raise HTTPException(status_code=400, detail="Student is not signed up for this activity")
 
-    # Validate student is signed up
-    if email not in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is not signed up for this activity"
-        )
+        session.delete(participant)
+        session.commit()
+        return {"message": f"Unregistered {email} from {activity_name}"}
 
-    # Remove student
-    activity["participants"].remove(email)
-    return {"message": f"Unregistered {email} from {activity_name}"}
+
+@app.on_event("startup")
+def on_startup():
+    # Create DB and tables
+    create_db_and_tables()
+
+    # If DB empty, migrate legacy activities
+    with get_session() as session:
+        existing = session.exec(select(Activity)).first()
+        if existing is None:
+            for name, payload in _legacy_activities.items():
+                a = Activity(name=name, description=payload.get("description"), schedule=payload.get("schedule"), max_participants=payload.get("max_participants"))
+                session.add(a)
+                session.commit()
+                # add participants
+                for email in payload.get("participants", []):
+                    p = Participant(email=email, activity_id=a.id)
+                    session.add(p)
+                session.commit()

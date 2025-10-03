@@ -1,2 +1,10 @@
+# no deps yet
+fastapi==0.95.2
+uvicorn==0.22.0
+sqlmodel==0.0.8
+"""
+Note: If you prefer SQLAlchemy directly, we can switch. SQLModel is a simple
+choice that works well with FastAPI and SQLite.
+"""
 fastapi
 uvicorn
